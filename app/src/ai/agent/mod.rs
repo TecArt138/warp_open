@@ -6,6 +6,7 @@ pub(crate) mod api;
 pub(crate) mod comment;
 pub(crate) mod icons;
 pub(crate) mod linearization;
+pub(crate) mod local;
 pub(crate) mod redaction;
 pub(crate) mod task;
 mod task_store;

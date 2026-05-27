@@ -26,6 +26,7 @@ use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, Update
 
 use crate::ai::agent::conversation::AIConversation;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::ai::local_agent_settings::LocalAgentSettings;
 use crate::ai::request_usage_model::RequestLimitInfo;
 use crate::auth::AuthStateProvider;
 use crate::report_if_error;
@@ -1554,9 +1555,10 @@ impl AISettings {
         let is_anonymous_or_logged_out = AuthStateProvider::as_ref(app)
             .get()
             .is_anonymous_or_logged_out();
+        let local_mode_without_login = LocalAgentSettings::is_local_mode_enabled(app);
 
         *self.is_any_ai_enabled
-            && !is_anonymous_or_logged_out
+            && (local_mode_without_login || !is_anonymous_or_logged_out)
             && !self.is_ai_disabled_due_to_remote_session_org_policy(app)
     }
 

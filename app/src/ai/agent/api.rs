@@ -16,6 +16,7 @@ pub use convert_from::{
 use futures_lite::Stream;
 pub use r#impl::generate_multi_agent_output;
 use serde::Serialize;
+use settings::Setting as _;
 use warp_core::channel::ChannelState;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
@@ -28,12 +29,20 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::{BlocklistAIPermissions, RequestInput, SessionContext};
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::LLMId;
+use crate::ai::local_agent_settings::{AgentProviderMode, LocalAgentSettings};
 use crate::ai::mcp::templatable_manager::TemplatableMCPServerInfo;
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::server::server_api::AIApiError;
 use crate::settings::AISettings;
 use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
 use crate::workspaces::user_workspaces::UserWorkspaces;
+
+#[derive(Debug, Clone)]
+pub struct LocalAgentConfig {
+    pub endpoint_url: String,
+    pub model_name: String,
+    pub api_key: Option<String>,
+}
 
 /// Unique, server-generated conversation-scoped token to be roundtripped to the API when sending
 /// requests that follow-up within a given conversation.
@@ -129,6 +138,8 @@ pub struct RequestParams {
     pub parent_agent_id: Option<String>,
     /// The display name for this agent (e.g. "Agent 1"), assigned by the orchestrator.
     pub agent_name: Option<String>,
+    /// When present, route this request through the local provider instead of Warp Cloud.
+    pub local_agent: Option<LocalAgentConfig>,
 }
 
 pub type Event = Result<warp_multi_agent_api::ResponseEvent, Arc<AIApiError>>;
@@ -247,6 +258,21 @@ impl RequestParams {
                 api_key_manager.custom_model_providers_for_request(is_custom_inference_enabled)
             })
             .flatten();
+        let local_agent = if FeatureFlag::LocalAgentProvider.is_enabled() {
+            let settings = LocalAgentSettings::as_ref(app);
+            if *settings.agent_provider_mode == AgentProviderMode::Local {
+                let local_api_key = settings.local_api_key.value().clone();
+                Some(LocalAgentConfig {
+                    endpoint_url: settings.local_endpoint_url.value().clone(),
+                    model_name: settings.local_model_name.value().clone(),
+                    api_key: (!local_api_key.is_empty()).then_some(local_api_key),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let allow_use_of_warp_credits = *AISettings::as_ref(app).can_use_warp_credits_for_fallback;
 
         let app_execution_mode = AppExecutionMode::as_ref(app);
@@ -343,6 +369,7 @@ impl RequestParams {
             supported_tools_override: request_input.supported_tools_override.clone(),
             parent_agent_id: None,
             agent_name: None,
+            local_agent,
         }
     }
 }

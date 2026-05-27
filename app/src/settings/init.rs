@@ -18,6 +18,7 @@ use super::{
     SshSettings, ThemeSettings, VimBannerSettings, WarpDrivePrivacySettings,
 };
 use crate::ai::cloud_agent_settings::CloudAgentSettings;
+use crate::ai::local_agent_settings::LocalAgentSettings;
 use crate::banner::BannerState;
 use crate::drive::settings::WarpDriveSettings;
 use crate::resource_center::TipsCompleted;
@@ -71,6 +72,7 @@ pub fn register_all_settings(ctx: &mut AppContext) {
     GeneralSettings::register(ctx);
     AISettings::register_and_subscribe_to_events(ctx);
     CloudAgentSettings::register(ctx);
+    LocalAgentSettings::register(ctx);
     ScrollSettings::register(ctx);
     SelectionSettings::register(ctx);
     InputModeSettings::register(ctx);

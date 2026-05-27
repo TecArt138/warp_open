@@ -7,6 +7,7 @@ use warp_multi_agent_api as api;
 
 use super::convert_to::convert_input;
 use super::{ConvertToAPITypeError, RequestParams, ResponseStream};
+use crate::ai::agent::local;
 use crate::ai::agent::redaction;
 use crate::server::server_api::ServerApi;
 use crate::terminal::model::session::SessionType;
@@ -22,7 +23,7 @@ pub async fn generate_multi_agent_output(
         .unwrap_or_else(|| get_supported_tools(&params));
     let supported_cli_agent_tools = get_supported_cli_agent_tools(&params);
     let mut logging_metadata = HashMap::new();
-    if let Some(metadata) = params.metadata {
+    if let Some(metadata) = params.metadata.as_ref() {
         logging_metadata.insert(
             "is_autodetected_user_query".to_owned(),
             prost_types::Value {
@@ -51,6 +52,14 @@ pub async fn generate_multi_agent_output(
 
     if params.should_redact_secrets {
         redaction::redact_inputs(&mut params.input);
+    }
+
+    if let Some(local_cfg) = params.local_agent.take() {
+        return Ok(local::local_agent_stream(
+            local_cfg,
+            params,
+            cancellation_rx,
+        ));
     }
 
     let api_keys = api_keys_with_warp_credit_fallback_setting(

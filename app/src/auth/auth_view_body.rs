@@ -26,6 +26,7 @@ use super::auth_view_shared_helpers::{
     PrivacySettingsHandles,
 };
 use super::AuthStateProvider;
+use crate::ai::local_agent_settings::LocalAgentSettings;
 use crate::appearance::Appearance;
 use crate::auth::auth_view_shared_helpers::render_offline_contents;
 use crate::editor::{
@@ -181,7 +182,8 @@ impl AuthViewBody {
             ctx.notify();
         });
 
-        let allow_loginless = !FeatureFlag::ForceLogin.is_enabled();
+        let allow_loginless =
+            !FeatureFlag::ForceLogin.is_enabled() || LocalAgentSettings::is_local_mode_enabled(ctx);
 
         let network_status = NetworkStatus::handle(ctx);
         ctx.subscribe_to_model(&network_status, |_, _, _, ctx| {

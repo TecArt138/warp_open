@@ -198,6 +198,7 @@ use crate::ai::execution_profiles::profiles::{AIExecutionProfilesModel, ClientPr
 use crate::ai::facts::view::AIFactPage;
 use crate::ai::facts::{AIFactManager, AIFactView, AIFactViewEvent};
 use crate::ai::llms::LLMPreferences;
+use crate::ai::local_agent_settings::LocalAgentSettings;
 use crate::ai::persisted_workspace::PersistedWorkspace;
 use crate::ai::{conversation_utils, AIRequestUsageModel};
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
@@ -15933,6 +15934,7 @@ impl Workspace {
         }
         if self.auth_state.is_anonymous_or_logged_out()
             && workflow.as_workflow().is_agent_mode_workflow()
+            && !LocalAgentSettings::is_local_mode_enabled(ctx)
         {
             AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                 auth_manager.attempt_login_gated_feature(

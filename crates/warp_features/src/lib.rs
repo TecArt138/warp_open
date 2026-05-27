@@ -879,6 +879,10 @@ pub enum FeatureFlag {
 
     /// Gates the Grouped Tabs feature.
     GroupedTabs,
+
+    /// Enables routing agent conversations through a local OpenAI-compatible
+    /// endpoint (for example Ollama) instead of Warp Cloud.
+    LocalAgentProvider,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -896,7 +900,11 @@ static USER_PREFERENCE_MAP: [AtomicTriState; cardinality::<FeatureFlag>()] =
 static FEATURES_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Features used in debugging.
-pub const DEBUG_FLAGS: &[FeatureFlag] = &[FeatureFlag::DebugMode, FeatureFlag::RuntimeFeatureFlags];
+pub const DEBUG_FLAGS: &[FeatureFlag] = &[
+    FeatureFlag::DebugMode,
+    FeatureFlag::RuntimeFeatureFlags,
+    FeatureFlag::LocalAgentProvider,
+];
 
 /// Features enabled for the development team.  The expectation is that, over
 /// time, these will move on to PREVIEW_FLAGS before being launched.
@@ -944,6 +952,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::DragTabsToWindows,
     FeatureFlag::RemoteCodebaseIndexing,
     FeatureFlag::GroupedTabs,
+    FeatureFlag::LocalAgentProvider,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Warp).
