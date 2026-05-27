@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest_eventsource::EventSource;
 use serde::{Deserialize, Serialize};

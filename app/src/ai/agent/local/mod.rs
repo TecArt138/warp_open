@@ -1,3 +1,4 @@
+mod anthropic;
 mod openai;
 
 use std::collections::{BTreeMap, HashMap};
@@ -6,20 +7,28 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use async_stream::stream;
 use futures_util::StreamExt;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use serde_json::json;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
-use crate::ai::agent::api::{LocalAgentConfig, RequestParams, ResponseStream};
 use crate::ai::agent::AIAgentInput;
+use crate::ai::agent::api::{LocalAgentConfig, RequestParams, ResponseStream};
 use crate::server::server_api::AIApiError;
 
 const RUN_SHELL_COMMAND_TOOL_NAME: &str = "run_shell_command";
 const CALL_MCP_TOOL_NAME: &str = "call_mcp_tool";
 const READ_MCP_RESOURCE_TOOL_NAME: &str = "read_mcp_resource";
 const READ_SKILL_TOOL_NAME: &str = "read_skill";
+const ANTHROPIC_MAX_TOKENS: u32 = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalProviderKind {
+    OpenAICompatible,
+    AnthropicMessages,
+}
 
 pub fn local_agent_stream(
     config: LocalAgentConfig,
@@ -33,61 +42,160 @@ pub fn local_agent_stream(
         .map(|task| task.id.clone())
         .unwrap_or_else(|| "root-task".to_string());
     let chat_messages = extract_chat_messages(&params, &task_id);
-    let tools = local_tool_definitions();
+    let provider_kind = local_provider_kind(&config.endpoint_url);
 
     let output_stream = stream! {
         yield Ok(stream_init_event(&request_id));
 
         let client = reqwest::Client::new();
-        let request = openai::ChatRequest {
-            model: config.model_name,
-            messages: chat_messages,
-            tools,
-            stream: true,
-        };
-
         let mut full_text = String::new();
         let mut pending_tool_calls: BTreeMap<usize, PendingToolCall> = BTreeMap::new();
-        let mut sse_stream = openai::stream_chat_completions(
-            client,
-            &config.endpoint_url,
-            config.api_key.as_deref(),
-            &request,
-        );
 
-        while let Some(chunk_result) = sse_stream.next().await {
-            let data = match chunk_result {
-                Ok(data) => data,
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
-            };
+        match provider_kind {
+            LocalProviderKind::OpenAICompatible => {
+                let request = openai::ChatRequest {
+                    model: config.model_name.clone(),
+                    messages: chat_messages.clone(),
+                    tools: local_tool_definitions(),
+                    stream: true,
+                };
+                let mut sse_stream = openai::stream_chat_completions(
+                    client.clone(),
+                    &config.endpoint_url,
+                    config.api_key.as_deref(),
+                    &request,
+                );
 
-            let parsed_chunk = match openai::parse_chunk(&data) {
-                Ok(chunk) => chunk,
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
-            };
+                while let Some(chunk_result) = sse_stream.next().await {
+                    let data = match chunk_result {
+                        Ok(data) => data,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
 
-            let Some(chunk) = parsed_chunk else {
-                break;
-            };
+                    let parsed_chunk = match openai::parse_chunk(&data) {
+                        Ok(chunk) => chunk,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
 
-            for choice in chunk.choices {
-                if let Some(content) = choice.delta.content {
-                    full_text.push_str(&content);
+                    let Some(chunk) = parsed_chunk else {
+                        break;
+                    };
+
+                    for choice in chunk.choices {
+                        if let Some(content) = choice.delta.content {
+                            full_text.push_str(&content);
+                        }
+                        for tool_delta in choice.delta.tool_calls {
+                            merge_tool_call_delta(&mut pending_tool_calls, tool_delta);
+                        }
+                        if matches!(choice.finish_reason.as_deref(), Some("content_filter")) {
+                            yield Err(Arc::new(AIApiError::Other(anyhow!(
+                                "Local model response was blocked by a content filter.",
+                            ))));
+                            return;
+                        }
+                    }
                 }
-                for tool_delta in choice.delta.tool_calls {
-                    merge_tool_call_delta(&mut pending_tool_calls, tool_delta);
-                }
-                if matches!(choice.finish_reason.as_deref(), Some("content_filter")) {
-                    yield Err(Arc::new(AIApiError::Other(anyhow!(
-                        "Local model response was blocked by a content filter.",
-                    ))));
-                    return;
+            }
+            LocalProviderKind::AnthropicMessages => {
+                let request = anthropic::MessagesRequest {
+                    model: config.model_name.clone(),
+                    messages: anthropic_messages_from_chat_messages(&chat_messages),
+                    tools: anthropic_tool_definitions(),
+                    max_tokens: ANTHROPIC_MAX_TOKENS,
+                    stream: true,
+                };
+                let mut sse_stream = anthropic::stream_messages(
+                    client,
+                    &config.endpoint_url,
+                    config.api_key.as_deref(),
+                    &request,
+                );
+
+                while let Some(chunk_result) = sse_stream.next().await {
+                    let data = match chunk_result {
+                        Ok(data) => data,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
+
+                    let parsed_event = match anthropic::parse_stream_event(&data) {
+                        Ok(event) => event,
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    };
+
+                    let Some(event) = parsed_event else {
+                        continue;
+                    };
+
+                    match event {
+                        anthropic::StreamEvent::TextDelta(delta) => {
+                            full_text.push_str(&delta);
+                        }
+                        anthropic::StreamEvent::ToolUseStart { index, id, name, input } => {
+                            let entry = pending_tool_calls.entry(index).or_default();
+                            if !id.is_empty() {
+                                entry.id = id;
+                            }
+                            if !name.is_empty() {
+                                entry.name = name;
+                            }
+                            if let Some(input) = input {
+                                entry.arguments = if input
+                                    .as_object()
+                                    .is_some_and(|object| object.is_empty())
+                                {
+                                    String::new()
+                                } else {
+                                    normalize_tool_input_json(input)
+                                };
+                            }
+                        }
+                        anthropic::StreamEvent::ToolUseInputDelta { index, partial_json } => {
+                            let entry = pending_tool_calls.entry(index).or_default();
+                            entry.arguments.push_str(&partial_json);
+                        }
+                        anthropic::StreamEvent::ToolUseStop { index } => {
+                            if let Some(entry) = pending_tool_calls.get_mut(&index) {
+                                if entry.arguments.trim().is_empty() {
+                                    entry.arguments = "{}".to_string();
+                                } else if let Some(normalized) =
+                                    normalize_partial_tool_input(&entry.arguments)
+                                {
+                                    entry.arguments = normalized;
+                                }
+                            }
+                        }
+                        anthropic::StreamEvent::MessageStop => {
+                            break;
+                        }
+                        anthropic::StreamEvent::ContentFiltered => {
+                            yield Err(Arc::new(AIApiError::Other(anyhow!(
+                                "Local model response was blocked by a content filter.",
+                            ))));
+                            return;
+                        }
+                        anthropic::StreamEvent::Error { kind, message } => {
+                            let user_message = format!("Anthropic stream error ({kind}): {message}");
+                            if kind == "overloaded_error" {
+                                yield Err(Arc::new(AIApiError::ServerOverloaded));
+                            } else {
+                                yield Err(Arc::new(AIApiError::Other(anyhow!(user_message))));
+                            }
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -449,6 +557,126 @@ fn local_tool_definitions() -> Vec<openai::ToolDefinition> {
             }),
         ),
     ]
+}
+
+fn anthropic_tool_definitions() -> Vec<anthropic::ToolDefinition> {
+    local_tool_definitions()
+        .into_iter()
+        .map(|tool| {
+            anthropic::ToolDefinition::new(
+                tool.function.name,
+                tool.function.description,
+                tool.function.parameters,
+            )
+        })
+        .collect()
+}
+
+fn anthropic_messages_from_chat_messages(
+    messages: &[openai::ChatMessage],
+) -> Vec<anthropic::Message> {
+    messages
+        .iter()
+        .filter_map(|message| match message.role.as_str() {
+            "user" => {
+                let content = message.content.clone().unwrap_or_default();
+                if content.trim().is_empty() {
+                    None
+                } else {
+                    Some(anthropic::Message::user(vec![
+                        anthropic::ContentBlock::text(content),
+                    ]))
+                }
+            }
+            "assistant" => {
+                let mut content_blocks = Vec::new();
+                if let Some(text) = message
+                    .content
+                    .clone()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    content_blocks.push(anthropic::ContentBlock::text(text));
+                }
+                if let Some(tool_calls) = message.tool_calls.as_ref() {
+                    content_blocks.extend(tool_calls.iter().map(|tool_call| {
+                        anthropic::ContentBlock::tool_use(
+                            tool_call.id.clone(),
+                            tool_call.function.name.clone(),
+                            parse_openai_tool_arguments_to_value(&tool_call.function.arguments),
+                        )
+                    }));
+                }
+                if content_blocks.is_empty() {
+                    None
+                } else {
+                    Some(anthropic::Message::assistant(content_blocks))
+                }
+            }
+            "tool" => {
+                let tool_use_id = message.tool_call_id.clone().unwrap_or_default();
+                if tool_use_id.trim().is_empty() {
+                    return None;
+                }
+                let content = message.content.clone().unwrap_or_default();
+                Some(anthropic::Message::user(vec![
+                    anthropic::ContentBlock::tool_result(tool_use_id, content),
+                ]))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_openai_tool_arguments_to_value(arguments: &str) -> Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+    serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
+}
+
+fn normalize_tool_input_json(value: Value) -> String {
+    if value.is_null() {
+        "{}".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn normalize_partial_tool_input(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some("{}".to_string());
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .map(normalize_tool_input_json)
+}
+
+fn local_provider_kind(endpoint_url: &str) -> LocalProviderKind {
+    if is_anthropic_messages_endpoint(endpoint_url) {
+        LocalProviderKind::AnthropicMessages
+    } else {
+        LocalProviderKind::OpenAICompatible
+    }
+}
+
+fn is_anthropic_messages_endpoint(endpoint_url: &str) -> bool {
+    let trimmed = endpoint_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1/messages") || trimmed.ends_with("/messages") {
+        return true;
+    }
+
+    if let Ok(parsed_url) = url::Url::parse(trimmed) {
+        let host_is_anthropic = parsed_url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.anthropic.com"));
+        let path_is_messages =
+            parsed_url.path().ends_with("/v1/messages") || parsed_url.path().ends_with("/messages");
+        return host_is_anthropic || path_is_messages;
+    }
+
+    false
 }
 
 fn merge_tool_call_delta(
